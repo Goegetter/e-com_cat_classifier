@@ -1,5 +1,8 @@
 .venv/
-data/
+data/embeddings/
+data/external
+data/processed
+data/raw/Product Data.csv
 .idea/
 tests/
 models/
