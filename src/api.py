@@ -13,8 +13,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+import pandas as pd
 
-# ── Ścieżki ──────────────────────────────────────────────
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -22,7 +23,7 @@ MODELS_DIR = PROJECT_ROOT / "models"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Definicje modeli (muszą zgadzać się z notebookiem) ───
+
 class SimpleNLPClassifier(nn.Module):
     def __init__(self, vocab_size, embed_dim, hidden_dim, num_classes, pad_idx=0):
         super().__init__()
@@ -42,23 +43,42 @@ class SimpleNLPClassifier(nn.Module):
 
 
 class E5Classifier(nn.Module):
-    def __init__(self, in_dim, hidden_dim, num_classes, dropout=0.3):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim,
+        num_classes,
+        dropout=0.3
+    ):
         super().__init__()
-        self.classifier = nn.Sequential(
+        self.hidden = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+        )
+        self.output = nn.Linear(
+            hidden_dim,
+            num_classes
         )
 
-    def forward(self, features):
-        return self.classifier(features)
+    def forward(
+        self,
+        features,
+        return_embeddings=False
+    ):
+        hidden_repr = self.hidden(features)
+        logits = self.output(hidden_repr)
+
+        if return_embeddings:
+            return logits, hidden_repr
+
+        return logits
 
 
-# ── Helpers ───────────────────────────────────────────────
+
 TEXT_COLS = ["Name_EN", "Description_EN", "Composition_EN"]
 CAT_COLS  = ["Gender", "Tree"]
-NUM_COLS  = ["Grammage", "WeightNet"]
+NUM_COLS  = ["Grammage", "Weight_net"]
 DEVICE    = torch.device("cpu")
 
 
@@ -87,21 +107,18 @@ def encode_text(text: str, vocab: dict, max_len: int):
         torch.tensor(mask, dtype=torch.float).unsqueeze(0),
     )
 
-
-# ── Lifespan — wczytanie modeli raz przy starcie ─────────
 loaded = {}
-
 
 @asynccontextmanager
 async def lifespan(app):
-    # v1 — TF-IDF (sklearn Pipeline: ColumnTransformer + LinearSVC)
+    # TF-IDF
     loaded["tfidf"] = joblib.load(MODELS_DIR / "tfidf_pipeline.joblib")
     loaded["tfidf_label_encoder"] = joblib.load(MODELS_DIR / "tfidf_label_encoder.joblib")
-    logger.info("TF-IDF wczytany")
+    logger.info("TF-IDF loaded")
     # DEBUG
     print(loaded["tfidf"].classes_[:10])
 
-    # v2 — SimpleNLP (PyTorch)
+    # SimpleNLP
     ckpt_mlp = torch.load(
         MODELS_DIR / "simple_nlp_classifier.pt", map_location=DEVICE
     )
@@ -117,15 +134,15 @@ async def lifespan(app):
     loaded["simple_nlp_vocab"]  = ckpt_mlp["vocab"]
     loaded["simple_nlp_labels"] = ckpt_mlp["label_classes"]
     loaded["simple_nlp_maxlen"] = ckpt_mlp["max_len"]
-    logger.info("SimpleNLP wczytany")
+    logger.info("SimpleNLP loaded")
 
-    # v3 — E5 (SentenceTransformer + E5Classifier + meta preprocessor)
+    # E5
     ckpt_e5 = torch.load(MODELS_DIR / "e5_embeddings_classifier.pt", map_location=DEVICE)
 
     state = ckpt_e5["model_state_dict"]
-    actual_hidden_dim = state["classifier.0.weight"].shape[0]  # ← 256
-    actual_in_dim = state["classifier.0.weight"].shape[1]  # ← 776
-    actual_num_classes = state["classifier.3.weight"].shape[0]  # ← 197
+    actual_hidden_dim = state["hidden.0.weight"].shape[0] # 256
+    actual_in_dim = state["hidden.0.weight"].shape[1]     # 776
+    actual_num_classes = state["output.weight"].shape[0]  # 197
 
     embed_model = SentenceTransformer("intfloat/multilingual-e5-base", device=str(DEVICE))
     meta_preprocessor = joblib.load(MODELS_DIR / "e5_meta_preprocessor.joblib")
@@ -143,7 +160,7 @@ async def lifespan(app):
     loaded["e5_embed_model"]   = embed_model
     loaded["e5_meta_prep"]     = meta_preprocessor
     loaded["e5_labels"]        = ckpt_e5["label_classes"]
-    logger.info("E5 wczytany")
+    logger.info("E5 loaded")
 
     yield
     loaded.clear()
@@ -151,16 +168,16 @@ async def lifespan(app):
 
 app = FastAPI(
     title="E-commerce Category Classification API",
-    description="3 modele klasyfikacji kategorii: TF-IDF (v1), SimpleNLP (v2), E5 (v3)",
+    description="3 category classification models: TF-IDF (v1), SimpleNLP (v2), E5 (v3)",
     version="1.0.0",
     lifespan=lifespan,
 )
 
-# ── Schematy Pydantic ────────────────────────────────────
 class ProductInput(BaseModel):
-    Name_EN: str         = Field(..., description="Nazwa produktu po angielsku")
-    Description_EN: str  = Field(..., description="Opis produktu")
-    Composition_EN: str  = Field(default="", description="Skład materiałowy")
+    SKU: str = Field(..., description="Product SKU")
+    Name_EN: str         = Field(..., description="English product name")
+    Description_EN: str  = Field(..., description="product description")
+    Composition_EN: str  = Field(default="", description="product composition")
     Gender: str         = Field(default="Unisex")
     Tree: str           = Field(default="")
     Grammage: float | None = Field(default=None)
@@ -176,11 +193,43 @@ class ProductInput(BaseModel):
         "Weight_net": 0.82,
     }}}
 
+class BatchProductInput(BaseModel):
+    products: list[ProductInput]
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "products": [
+                    {
+                        "SKU": "TTD/0221/L021/5",
+                        "Name_EN": "Men softshell winter jacket",
+                        "Description_EN": "Water resistant jacket with zipper pockets",
+                        "Composition_EN": "94% polyester 6% elastane",
+                        "Gender": "Male",
+                        "Tree": "Textile",
+                        "Grammage": 280,
+                        "Weight_net": 0.82
+                    },
+                    {
+                        "SKU": "GKK/TS548/L335",
+                        "Name_EN": "Running shoes",
+                        "Description_EN": "Lightweight running shoes",
+                        "Composition_EN": "Synthetic mesh",
+                        "Gender": "Unisex",
+                        "Tree": "Textile",
+                        "Grammage": 450,
+                        "Weight_net": 0.55
+                    }
+                ]
+            }
+        }
+    }
+
 
 class PredictionResult(BaseModel):
     model:      str
-    category:   str   = Field(..., description="Kod kategorii, np. TOZB")
-    top5: list[dict]  = Field(default=[], description="Top-5 kategorii z prawdopodobieństwami")
+    category:   str   = Field(..., description="Category code eg. TOZB")
+    top5: list[dict]  = Field(default=[], description="Top-5 categories with probabilities")
 
 
 class CompareResponse(BaseModel):
@@ -188,8 +237,13 @@ class CompareResponse(BaseModel):
     v2_simple_nlp: PredictionResult
     v3_e5:         PredictionResult
 
+class BatchPredictionItem(BaseModel):
+    SKU: str
+    category: str
 
-# ── Funkcje predykcji ────────────────────────────────────
+class BatchPredictionResponse(BaseModel):
+    predictions: list[BatchPredictionItem]
+
 def predict_tfidf(product: ProductInput) -> PredictionResult:
     import pandas as pd
     text = " ".join([product.Name_EN, product.Description_EN, product.Composition_EN]).strip()
@@ -205,7 +259,7 @@ def predict_tfidf(product: ProductInput) -> PredictionResult:
     le = loaded["tfidf_label_encoder"]
     pred_label = le.inverse_transform([pred_idx])[0]
 
-    # LinearSVC nie ma predict_proba — zwróć decision_function jako score
+    # LinearSVC has no predict_proba — return decision_function as score
     scores = loaded["tfidf"].decision_function(row)[0]
     top5_idx = np.argsort(scores)[::-1][:5]
     classes = loaded["tfidf"].classes_
@@ -228,7 +282,6 @@ def predict_simple_nlp(product: ProductInput) -> PredictionResult:
 
     input_ids, attention_mask = encode_text(text, vocab, maxlen)
 
-    # DEBUG
     print("=== DEBUG SIMPLE NLP ===")
     print("labels type:", type(labels))
     print("labels sample:", labels[:5])
@@ -285,7 +338,62 @@ def predict_e5(product: ProductInput) -> PredictionResult:
     return PredictionResult(model="E5", category=labels[int(np.argmax(probs))], top5=top5)
 
 
-# ── Endpointy ────────────────────────────────────────────
+def predict_e5_batch(products: list[ProductInput]) -> list[PredictionResult]:
+    texts = []
+    meta_rows = []
+    for product in products:
+        text = " ".join([
+            f"passage: {product.Name_EN}",
+            product.Description_EN,
+            product.Composition_EN
+        ]).strip()
+        texts.append(text)
+
+        meta_rows.append({
+            "Gender": product.Gender,
+            "Tree": product.Tree,
+            "Grammage": product.Grammage if product.Grammage is not None else 0.0,
+            "Weight_net": product.Weight_net if product.Weight_net is not None else 0.0,
+        })
+
+    emb = loaded["e5_embed_model"].encode(
+        texts,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        batch_size=32,
+        show_progress_bar=False,
+    )
+
+    meta_df = pd.DataFrame(meta_rows)
+    meta = loaded["e5_meta_prep"].transform(meta_df)
+
+    if hasattr(meta, "toarray"):
+        meta = meta.toarray()
+
+    X = np.concatenate(
+        [emb, meta.astype(np.float32)],axis=1)
+
+    tensor = torch.from_numpy(X).float().to(DEVICE)
+    labels = loaded["e5_labels"]
+
+    with torch.no_grad():
+        logits = loaded["e5"](tensor)
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+
+    results = []
+
+    for product, prob_vector in zip(products, probs):
+        pred_idx = int(np.argmax(prob_vector))
+        pred_label = str(labels[pred_idx])
+        results.append(
+            BatchPredictionItem(
+                SKU=product.SKU,
+                category=pred_label
+            )
+        )
+    return results
+
+
 @app.get("/")
 def root():
     return {"message": "E-commerce Category Classification API", "docs": "/docs"}
@@ -323,8 +431,30 @@ def predict_v3(product: ProductInput):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post(
+    "/predict-batch/e5NLP",
+    response_model=BatchPredictionResponse,
+    summary="Batch prediction for E5 model"
+)
 
-@app.post("/predict/compare", response_model=CompareResponse, summary="Porównanie wszystkich 3 modeli")
+def predict_batch_e5(batch: BatchProductInput):
+    try:
+        if len(batch.products) > 1000:
+            raise HTTPException(
+                status_code=400,
+                detail="Max batch size is 1000"
+            )
+        predictions = predict_e5_batch(batch.products)
+
+        return BatchPredictionResponse(predictions=predictions)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+@app.post("/predict/compare", response_model=CompareResponse, summary="Comparison of all 3 models")
 def predict_compare(product: ProductInput):
     try:
         return CompareResponse(
