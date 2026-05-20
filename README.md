@@ -5,8 +5,6 @@ An e-commerce product category classifier for English product texts, based on se
 - a simple NLP model with a custom vocabulary and a PyTorch neural network,
 - an embedding-based classifier using `intfloat/multilingual-e5-base` with additional meta-features.
 
-The project follows a typical data science project structure: raw and processed data, experimental notebooks, source code in `src/`, and trained model artifacts in `models/`.
-
 ---
 
 ## Project Structure
@@ -37,11 +35,8 @@ e-com_cat_classifier/
 ├── src/
 │   └── api.py                          # inference / API logic
 ├── .gitignore
-├── requirements.txt
-└── TODO.txt
+└── requirements.txt
 ```
-
-> Note: this README intentionally reflects the structure shown in the project screenshot, excluding `04_predictions` and `tests`.
 
 ---
 
